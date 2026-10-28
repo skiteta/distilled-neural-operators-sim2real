@@ -1,0 +1,4 @@
+**/__pycache__
+**/*.pyc
+runs/FINAL_REBUILD/R1_*
+data

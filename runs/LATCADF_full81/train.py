@@ -1,0 +1,130 @@
+"""Paired full-scale fine-tuning with/without released-sample vertical reflection; standard inference."""
+import argparse,copy,gc,hashlib,importlib.util,json,os,signal,sys,time
+from pathlib import Path
+ROOT=Path(__file__).resolve().parents[2];OUT=Path(__file__).resolve().parent;sys.path.insert(0,str(ROOT/'src'))
+def read(p):return json.loads(Path(p).read_text())
+def write(p,x):Path(p).write_text(json.dumps(x,ensure_ascii=False,indent=2)+'\n')
+def sha(p):return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+sys.path.insert(0,str(ROOT/'scripts'))
+from inferred_score_objective import training_loss as composite_training_loss
+
+def phase_cadence(data,index,phase,cad):
+ """Exact released subsampling in space (2x2 phase) and time (spacing 1 or 2); no generated values."""
+ import torch
+ assert 0<=phase<4 and cad in (0,1)
+ ci,start=data.windows[index];dy,dx=divmod(phase,2)
+ assert cad==0 or start+79<=data.flows[ci].shape[0],'caller must resolve trailing-start fallback'
+ sp=cad+1
+ uv=data.flows[ci][start:start+40*sp:sp,dy::2,dx::2]
+ assert uv.shape==(40,32,64,2),uv.shape
+ native=torch.cat((uv,torch.zeros_like(uv[...,:1])),dim=-1)
+ return native[:20],native[20:],torch.tensor(index,dtype=torch.long)
+def main(seconds,arm):
+ import torch
+ from torch.utils.checkpoint import checkpoint
+ from realpde import identity_interval_hardening as M
+ from realpde.data import discover_cases
+ from realpde.released_lattice_dataset import ReleasedLatticeDataset as ReleasedTemporalStartDataset
+ from realpde.fixed_sps_head_training import TrainingBudget
+ from realpde.hidden_sps_interval import load_hidden_residual
+ from realpde.sps_radius_capacity import load_expanded_head
+ from realpde.model import OperatorBlock
+ from realpde.metrics import relative_l2,tke_relative_l2,profile_relative_l2
+ from reflection_transform import reflect_velocity_fields,restore_native_geometry
+ class Budget(TrainingBudget):
+  def check(self):
+   v=self.snapshot()
+   for k,limit in [('peak_host_bytes',20*1024**3),('peak_device_bytes',8*1024**3)]:
+    if v[k]>limit:raise RuntimeError('RESOURCE_CAP '+k)
+   return v
+ m=read(OUT/(arm+'_plan.json'));assert all(sha(ROOT/p)==h for p,h in m['source_pins'].items());dest=OUT/('training_'+arm);dest.mkdir();budget=Budget(dest,seconds,seconds)
+ torch.set_num_threads(4);torch.set_num_interop_threads(1);torch.manual_seed(m['training']['seed']);torch.use_deterministic_algorithms(True);torch.backends.cudnn.benchmark=False;torch.backends.cudnn.deterministic=True;torch.cuda.set_per_process_memory_fraction(4*1024**3/torch.cuda.get_device_properties(0).total_memory);device=torch.device('cuda');budget.gpu_started=time.monotonic()
+ rt=ROOT/m['runtime'];spec=importlib.util.spec_from_file_location('c716g_point',rt/'factorized_model.py');F=importlib.util.module_from_spec(spec);sys.modules[spec.name]=F;spec.loader.exec_module(F)
+ import inspect,textwrap
+ detached_forward=F.FactorizedFlowOperator.forward;forward_code=textwrap.dedent(inspect.getsource(detached_forward));assert forward_code.count('hidden.detach()')==2
+ namespace=dict(F.__dict__);exec(forward_code.replace('hidden.detach()','hidden'),namespace);F.FactorizedFlowOperator.forward=namespace['forward']
+ cp=torch.load(rt/'model.pt',map_location='cpu',weights_only=False);point=F.FactorizedFlowOperator(F.ModelConfig.from_dict(cp['model_config'])).to(device);point.load_state_dict(cp['state_dict']);point.train().requires_grad_(True)
+ keys={'center':'center_head.pt','radius':'radius_head.pt','hidden':'hidden_head.pt','observed':'observed_center_head.pt'}
+ heads=torch.nn.ModuleDict({k:M.load_head(rt/f,device) if k=='center' else load_expanded_head(rt/f,device) if k=='radius' else load_hidden_residual(rt/f,device) for k,f in keys.items()}).eval().requires_grad_(True)
+ dropout_modules={n:v for n,v in point.named_modules() if isinstance(v,torch.nn.Dropout)}
+ assert len(dropout_modules)==12 and all(v.training and v.p==.03 for v in dropout_modules.values())
+ ema_point=copy.deepcopy(point).eval().requires_grad_(False);ema_heads=copy.deepcopy(heads).eval().requires_grad_(False);initial={'point':M.state_hash(point),**{k:M.state_hash(v) for k,v in heads.items()}}
+ original=OperatorBlock.forward
+ def block(self,x):
+  if torch.is_grad_enabled() and x.requires_grad:return checkpoint(lambda a:original(self,a),x,use_reentrant=False,preserve_rng_state=True)
+  return original(self,x)
+ OperatorBlock.forward=block
+ def forward(x):
+  hidden=[];handle=point.final_norm.register_forward_hook(lambda mod,inp,out:hidden.append(out))
+  try:p=point(x)
+  finally:handle.remove()
+  assert len(hidden)==1;h=hidden[0];diagnostics,scale=M.flow_diagnostics(x,p);shift,_=heads['center'](diagnostics);_,radius=heads['radius'](diagnostics);ds,dl=heads['hidden'](h);raw=((x[...,:2]-x[...,:2].mean(1,keepdim=True))/scale).permute(0,1,4,2,3).reshape(-1,40,32,64);obs,odl=heads['observed'](torch.cat((h,raw),1));rad=radius*dl.exp();rad=rad*odl.exp() if m['training']['observed_width'] else rad;return p,shift+ds+obs,rad,scale,h
+ try:
+  assert not set(m['train_cases'])&set(m['eval_cases'])
+  cases=[c for c in discover_cases(str(ROOT/'data/extracted/train_real'),exclude_files=['7575_0.h5']) if c.path.name in m['train_cases']];assert [c.path.name for c in cases]==m['train_cases'] and len(cases)==len(m['train_cases']) and not set(m['train_cases'])&set(m['eval_cases']);data=ReleasedTemporalStartDataset(cases,stride=m['sampling']['stride'],budget=budget);data.windows=[(i,s) for i,c in enumerate(cases) for s in range(0,c.frames-m['sampling']['support_frames']+1,m['sampling']['stride'])];assert len(data)==m['sampling']['windows']
+  from realpde.data import FlowWindowDataset
+  checked=[]
+  for ci in [0,len(cases)-1]:
+   disk=FlowWindowDataset([cases[ci]],stride=1)
+   valid_starts=[s for i,s in data.windows if i==ci]
+   for local in [valid_starts[0],valid_starts[len(valid_starts)//2],valid_starts[-1]]:
+    pos=data.windows.index((ci,local));xx,yy,_=data[pos];dx,dy=disk[local];assert torch.equal(xx,dx) and torch.equal(yy,dy);checked.append({'case':cases[ci].path.name,'start':local,'last_input':local+19,'first_target':local+20,'last_target':local+39})
+  write(dest/'sampling_checks.json',{'all_cases':len(cases),'windows':len(data),'stride':m['sampling']['stride'],'support_frames':m['sampling']['support_frames'],'first_middle_last_windows_bitexact_official_dataset':checked,'paired_sampling':m['sampling'],'new_case_groups':0,'new_independent_cases':0,'synthetic_data':False,'eval_case_overlap':False})
+  write(dest/'job.json',{'pid':os.getpid(),'train_cases':m['train_cases'],'sample_ids':[[cases[i].path.name,s] for i,s in data.windows],'train_h5_sha256':{c.path.name:sha(c.path) for c in cases},'outer_target_reads':False,'initial_states':initial,'steps_planned':m['training']['steps'],'source_plan_sha256':sha(OUT/(arm+'_plan.json')),'dropout_disabled_eval_mode':False,'dropout_probability':.03,'dropout_modules':list(dropout_modules),'EMA_inference_eval':True})
+  opt=torch.optim.AdamW([{'params':point.parameters(),'lr':m['training']['point_lr']},{'params':heads.parameters(),'lr':m['training']['head_lr']}],weight_decay=1e-4);steps=m['training']['steps'];schedule_steps=m['training']['schedule_steps'];scheduler=torch.optim.lr_scheduler.LambdaLR(opt,lambda t:.01+.99*.5*(1+__import__('math').cos(__import__('math').pi*t/schedule_steps)));rng=torch.Generator().manual_seed(m['training']['seed']+1);digest=hashlib.sha256();seen=set();last_step=0;started=time.monotonic();first_checks=None;order=torch.randperm(len(data),generator=rng);cursor=0
+
+  resume_step=0;saved={'batch_digest':None};initial_point_hash=M.state_hash(point)
+  augment_rng=torch.Generator().manual_seed(m['training']['seed']+2);augment_digest=hashlib.sha256();reflected_samples=0;source_samples=0
+  phase_rng=torch.Generator().manual_seed(m['training']['seed']+3);phase_digest=hashlib.sha256();phase_counts=[0]*4;case_phase_counts=[[0]*4 for c in cases];cadence_rng=torch.Generator().manual_seed(m['training']['seed']+4);cadence_digest=hashlib.sha256();cadence_counts=[0,0];cadence_fallbacks=[0];CAD_P=float(m['training']['cadence2_probability'])
+  write(dest/'initialization_audit.json',dict(initialization='Actual current deployed point and4heads; fresh paired optimizer and sampling.',initial_states=initial,point_trainable=True,reflection_active=m['training']['reflection_active'],runtime_observed_width=m['training']['observed_width'],no_runtime_TTA=True))
+  last_step=resume_step
+  with (dest/'curve.jsonl').open('x') as log:
+   for step in range(resume_step+1,steps+1):
+    budget.check()
+    if cursor>=len(data):order=torch.randperm(len(data),generator=rng);cursor=0
+    ix=order[cursor:cursor+8];cursor+=len(ix);seen.update(ix.tolist());digest.update(ix.numpy().tobytes());phases=torch.randint(4,(len(ix),),generator=phase_rng);phase_digest.update(phases.numpy().tobytes())
+    for index,phase in zip(ix.tolist(),phases.tolist()):phase_counts[phase]+=1;case_phase_counts[data.windows[index][0]][phase]+=1
+    cads=(torch.rand(len(ix),generator=cadence_rng)<CAD_P).long();cadence_digest.update(cads.numpy().tobytes());requested=cads.tolist();cads=torch.tensor([c if (c==0 or data.windows[i][1]+79<=data.flows[data.windows[i][0]].shape[0]) else 0 for i,c in zip(ix.tolist(),requested)]);cadence_fallbacks[0]+=sum(1 for r,a in zip(requested,cads.tolist()) if r==1 and a==0);[cadence_counts.__setitem__(c,cadence_counts[c]+1) for c in cads.tolist()];items=[phase_cadence(data,i,p,c) for i,p,c in zip(ix.tolist(),phases.tolist(),cads.tolist())];x=torch.stack([v[0] for v in items]).to(device);target=torch.stack([v[1] for v in items]).to(device)
+    native_input=x
+    flip_mask=torch.rand(len(ix),generator=augment_rng)<.5;augment_digest.update(flip_mask.numpy().tobytes());source_samples+=len(ix)
+    if m['training']['reflection_active']:
+     if step==1:assert torch.equal(reflect_velocity_fields(reflect_velocity_fields(x)),x) and torch.equal(reflect_velocity_fields(reflect_velocity_fields(target)),target)
+     selected=flip_mask.to(device);x=torch.where(selected[:,None,None,None,None],reflect_velocity_fields(x),x);reflected_samples+=int(flip_mask.sum())
+    if step==1:forward_cuda_rng=torch.cuda.get_rng_state(device)
+    opt.zero_grad(set_to_none=True);pred,shift,radius,scale,h=forward(x)
+    if step==1:
+     with torch.random.fork_rng(devices=[device]),torch.no_grad():
+      torch.cuda.set_rng_state(forward_cuda_rng,device);assert torch.equal(detached_forward(point,x),pred.detach())
+      stochastic_other=detached_forward(point,x);assert not torch.equal(stochastic_other,pred.detach())
+      point.eval();det_a=point(x);det_b=point(x);assert torch.equal(det_a,det_b);point.train()
+      assert all(v.training for v in dropout_modules.values()) and not ema_point.training
+    if m['training']['reflection_active']:pred,shift,radius,scale=restore_native_geometry(pred,shift,radius,scale,native_input,selected)
+    l2=relative_l2(pred,target);tke=tke_relative_l2(pred,target);mvpe=profile_relative_l2(pred,target);early=relative_l2(pred[:,:3],target[:,:3]);factor=M.sample_factor(pred,target);err=(target[...,:2]-pred[...,:2])/scale;mask=target[...,:2]!=0;tau=m['training']['tau_fixed'];reward=(factor[:,None,None,None,None]*torch.sigmoid((radius-(err-shift).abs())/tau)*torch.exp(-2*radius*scale/M.SIGMA_GLOBAL))[mask].mean();pc=pred[...,:2]-pred[...,:2].mean(1,keepdim=True);tc=target[...,:2]-target[...,:2].mean(1,keepdim=True);pn=torch.linalg.vector_norm(pc,dim=(1,4),keepdim=True);tn=torch.linalg.vector_norm(tc,dim=(1,4),keepdim=True);wave=relative_l2(pc*(tn/pn.clamp_min(1e-8)),tc) if m['training']['phase_energy_normalized'] else relative_l2(pred-pred.mean(1,keepdim=True),target-target.mean(1,keepdim=True));late=relative_l2(pred[:,10:],target[:,10:]);loss=composite_training_loss(l2,tke,mvpe,reward)
+    if step==resume_step+1:
+     assert pred.requires_grad and h.requires_grad and factor.requires_grad
+     hp=tuple(heads.parameters());grad=torch.autograd.grad(reward,hp,retain_graph=True,allow_unused=True);byhead={};offset=0
+     for name,head in heads.items():
+      count=len(tuple(head.parameters()));byhead[name]=sum(float(g.norm()) for g in grad[offset:offset+count] if g is not None);offset+=count
+     assert all(v>0 for v in byhead.values())
+     first_checks=dict(original_forward_bitexact=True,dropout_rng_replay_bitexact=True,dropout_changes_training_prediction=True,eval_repeat_bitexact=True,dropout_modules=list(dropout_modules),dropout_probability=.03,point_trainable=True,all_four_head_SPS_gradients_nonzero=byhead,initial_point_sha256=initial_point_hash,reflection_active=m['training']['reflection_active'],native_coordinate_metric_probes_preserved=True,reflection_twice_restores_input_and_target=True if m['training']['reflection_active'] else None,first_source_indices=ix.tolist(),first_reflection_mask=flip_mask.tolist(),runtime_observed_width=m['training']['observed_width'])
+    assert torch.isfinite(loss);loss.backward();gp=torch.nn.utils.clip_grad_norm_(point.parameters(),1.,error_if_nonfinite=True);assert gp>0;gh=torch.nn.utils.clip_grad_norm_(heads.parameters(),1.,error_if_nonfinite=True);assert gh>0;opt.step();scheduler.step();last_step=step
+    if step==1:first_checks.update(point_loss_gradient_norm=float(gp),lattice_active=True,first_phases=phases.tolist(),raw_storage_bytes=data.storage_bytes,all_point_parameters_trainable=all(p.requires_grad for p in point.parameters()));write(dest/'first_intervention_checks.json',first_checks)
+    with torch.no_grad():
+     for dst,src in [(ema_point,point),(ema_heads,heads)]:
+      for a,b in zip(dst.parameters(),src.parameters()):a.lerp_(b,1-m['training']['EMA'])
+      for a,b in zip(dst.buffers(),src.buffers()):a.copy_(b)
+    if step==resume_step+1 or step%100==0 or step==steps:
+     row={'step':step,'loss':float(loss.detach()),'rel_l2':float(l2.detach()),'tke':float(tke.detach()),'mvpe':float(mvpe.detach()),'early3':float(early.detach()),'energy_normalized_phase':float(wave.detach()),'late10':float(late.detach()),'soft_SPS_reward':float(reward.detach()),'tau':tau,'phase_counts':phase_counts,'point_grad':float(gp),'heads_grad':float(gh),'lr':scheduler.get_last_lr(),'training_seconds':time.monotonic()-started,'resume_step':resume_step,'new_updates':step-resume_step};log.write(json.dumps(row)+'\n');log.flush();print(json.dumps(row),flush=True);write(dest/'heartbeat.json',dict(step=step,**budget.check()))
+    if step in {m['middle_step'],steps}:
+     torch.save({'step':step,'point':point.state_dict(),'heads':heads.state_dict(),'ema_point':ema_point.state_dict(),'ema_heads':ema_heads.state_dict(),'optimizer':opt.state_dict(),'scheduler':scheduler.state_dict(),'rng':rng.get_state(),'torch_rng':torch.get_rng_state(),'cuda_rng':torch.cuda.get_rng_state(device),'sampler_order':order,'sampler_cursor':cursor,'unique_sampled_windows':len(seen),'batch_digest':digest.hexdigest(),'batch_digest_scope':'fresh_source_window_stream','prior_batch_digest':None,'augmentation_rng':augment_rng.get_state(),'phase_rng':phase_rng.get_state(),'phase_digest':phase_digest.hexdigest(),'phase_counts':phase_counts,'case_phase_counts':case_phase_counts,'augmentation_digest':augment_digest.hexdigest(),'source_samples':source_samples,'reflected_samples':reflected_samples,'resume_step':resume_step,'plan_sha256':sha(OUT/(arm+'_plan.json'))},dest/('resume_'+str(step)+'.pt'))
+  assert {cases[data.windows[i][0]].path.name for i in seen}==set(m['train_cases'])
+  assert last_step==steps and scheduler.last_epoch==steps and len(seen)==len(data)
+  assert sum(phase_counts)==source_samples and all(min(v)>0 for v in case_phase_counts)
+  assert M.state_hash(point)!=initial_point_hash and M.state_hash(ema_point)!=initial_point_hash
+  assert (reflected_samples>0)==m['training']['reflection_active']
+  assert not point.final_norm._forward_hooks;assert all(sha(ROOT/p)==h for p,h in m['source_pins'].items())
+  write(dest/'report.json',dict(status='COMPLETE',released_lattice_phases=True,released_cadence2_probability=CAD_P,cadence_counts=cadence_counts,cadence_trailing_fallbacks=cadence_fallbacks[0],cadence_digest=cadence_digest.hexdigest(),phase_counts=phase_counts,case_phase_counts=case_phase_counts,phase_digest=phase_digest.hexdigest(),raw_storage_bytes=data.storage_bytes,backbone_dropout_probability=.03,dropout_module_names=list(dropout_modules),EMA_inference_eval=not ema_point.training,steps_actual=last_step,new_updates_actual=last_step-resume_step,resume_step=resume_step,middle_step=m['middle_step'],gradient_checks=first_checks,training_loop_seconds=time.monotonic()-started,budget=budget.check(),schedule_steps=schedule_steps,final_lr=scheduler.get_last_lr(),final_tau=tau,selection='Fixed exposure-matched EMA endpoint; A native/B random vertical reflection, all point and4heads trainable. No validation-based stopping.',initial_point_sha256=initial_point_hash,final_point_sha256=M.state_hash(point),reflected_samples=reflected_samples,source_samples=source_samples,augmentation_digest=augment_digest.hexdigest(),runtime_architecture_unchanged=True,no_runtime_TTA=True))
+ except BaseException as e:write(dest/'failure.json',{'error':repr(e),'budget':budget.snapshot()});raise
+ finally:OperatorBlock.forward=original;write(dest/'budget.json',budget.snapshot())
+if __name__=='__main__':
+ p=argparse.ArgumentParser();p.add_argument('--seconds',type=float,required=True);p.add_argument('--arm',choices=['previous','candidate'],required=True);a=p.parse_args();main(a.seconds,a.arm)

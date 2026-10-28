@@ -1,0 +1,15 @@
+{
+  "method": "Restore existing C787-tested portable NVRTC loader in both new modules",
+  "changed_members": [
+    "realpde/fused_half_ffn_cuda.py",
+    "realpde/fused_local_residual_cuda.py"
+  ],
+  "source_zip": "submissions/20260921_053123_JST__READY__C890H_FULL81.zip",
+  "source_sha256": "7ad296264a248d3452b70b2d64f26bcd1223740d806283abb4c1227477781456",
+  "all_five_weights_unchanged": true,
+  "CUDA_source_math_unchanged": true,
+  "submission_predict_code_unchanged": true,
+  "reason": "Original modules hardcoded pip NVRTC path; official image uses conda /opt/conda/lib. No fallback predictions or changes to score formula.",
+  "source_observation": "User screenshot submission936335, missing predictions.npz. Exact upstream remote exception not available.",
+  "actual_submission": false
+}

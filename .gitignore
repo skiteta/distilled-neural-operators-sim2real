@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+/data/
+/output/
+/runs/FINAL_REBUILD/R1_*/
+/vendor/starting_kit_v9/scoring.py

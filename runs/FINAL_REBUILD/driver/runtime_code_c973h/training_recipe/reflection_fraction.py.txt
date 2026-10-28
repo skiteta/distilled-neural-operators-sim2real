@@ -1,0 +1,40 @@
+"""Recover coherent50%/75%reflected updates across all5states."""
+import hashlib,io,json,sys,zipfile
+from pathlib import Path
+import torch
+ROOT=Path(__file__).resolve().parents[2]
+sys.path.insert(0,str(ROOT/'runs/C812R_point_preserved_reflection'))
+from transfer import archive,state_hash,FILES
+sys.path.insert(0,str(ROOT/'runs/C800R_reflection_weight_soup'))
+from weight_soup import average_state
+
+def sha(p):return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+def read(p):return json.loads(Path(p).read_text())
+def rel(p):return str(Path(p).relative_to(ROOT))
+def deployment_code(blobs):return {k:v for k,v in blobs.items() if k not in FILES and not k.startswith('training_recipe/')}
+
+def assemble(out,cid,original,reflected,reference,variant,provenance,train_source,transform_source):
+ blobs,base=archive(original);current_blobs,current=archive(reference);assert deployment_code(blobs)==deployment_code(current_blobs)
+ assert variant in ['previous','candidate']
+ alpha={'previous':.5,'candidate':.75}[variant]
+ states={k:average_state({'original':base[k],'reflected':reflected[k]},{'original':1-alpha,'reflected':alpha}) for k in base}
+ assert any(not torch.equal(v,base['point'][k]) for k,v in states['point'].items())
+ target=out/(cid+'_REFLECTION_FRACTION_RESEARCH.zip');members={}
+ with zipfile.ZipFile(target,'x',zipfile.ZIP_DEFLATED) as z:
+  for name,data in blobs.items():
+   if name.startswith('training_recipe/'):continue
+   if name in FILES:
+    key=FILES[name];payload=torch.load(io.BytesIO(data),map_location='cpu',weights_only=False);payload['state_dict']=states[key];payload['reflection_fraction']=dict(alpha=alpha,variant=variant,source=provenance);buf=io.BytesIO();torch.save(payload,buf);data=buf.getvalue();again=torch.load(io.BytesIO(data),map_location='cpu',weights_only=False)['state_dict'];assert all(torch.equal(v,again[k]) for k,v in states[key].items())
+   z.writestr(name,data);members[name]=hashlib.sha256(data).hexdigest()
+  recipe=dict(original=original,reflected_source=provenance,current_interval_reference=reference,alpha=alpha,head_mode='all5states coherently averaged at alpha'+str(alpha),new_training_claim=False,complete_from_scratch_handoff='Separate Decision Phase task; released-only ancestor recipes retained in project.')
+  for name,data in [('training_recipe/reflection_fraction.py.txt',Path(__file__).read_bytes()),('training_recipe/average_state.py.txt',(ROOT/'runs/C800R_reflection_weight_soup/weight_soup.py').read_bytes()),('training_recipe/source_train.py.txt',Path(train_source).read_bytes()),('training_recipe/reflection_transform.py.txt',Path(transform_source).read_bytes()),('training_recipe/combination.json',(json.dumps(recipe,ensure_ascii=False,indent=2)+'\n').encode())]:z.writestr(name,data);members[name]=hashlib.sha256(data).hexdigest()
+ cp=out/(cid+'_deployed_checkpoint.pt');torch.save(dict(ema_point=states['point'],ema_heads={name+'.'+k:v for name,s in states.items() if name!='point' for k,v in s.items()},provenance=recipe,step=provenance.get('steps_actual',0)),cp)
+ with zipfile.ZipFile(target) as z:assert z.testzip() is None and sum(v.file_size for v in z.infolist())<256000000 and {n:hashlib.sha256(z.read(n)).hexdigest() for n in z.namelist()}==members;assert deployment_code({n:z.read(n) for n in z.namelist()})==deployment_code(blobs)
+ result=dict(path=rel(target),sha256=sha(target),runtime_members=members,checkpoint=rel(cp),checkpoint_sha256=sha(cp),all_five_deployed_states_exact=True,alpha=alpha,variant=variant,step=provenance.get('steps_actual',0));archive(result);return result
+
+def select_reference(cfg,full):
+ source=ROOT/'runs'/('C819R_full81_reflection_only_shrink' if full else cfg['shrink']);arm='candidate' if full else 'previous';q=read(source/'quality_plan.json');ref=q['archives'][arm];baseline='C819H' if full else read(source/'confirmation/report.json')['comparisons'][arm]['candidate']
+ decision=read(ROOT/'runs/C825R_reflection_prediction_anchor/cycle_summary.json');fr=ROOT/'runs/C828R_reflection_prediction_anchor/final_report.json'
+ if decision['accepted_for_full81'] and fr.exists() and read(fr).get('ready_zip'):
+  source=ROOT/'runs'/cfg['anchored'];arm='candidate';q=read(source/'quality_plan.json');ref=q['archives'][arm];baseline=read(fr)['candidate'] if full else read(source/'confirmation/report.json')['comparisons'][arm]['candidate']
+ return ref,source,arm,baseline,q

@@ -1,0 +1,115 @@
+schema_version: 1
+method_id: C180_RELEASE_ONLY_SCRATCH_RETRAIN
+seed: 20260808
+device: auto
+
+data:
+  sim_dir: data/extracted/train_sim
+  real_dir: data/extracted/train_real
+  exclude_files:
+    - 7575_0.h5
+  retained_duplicate_source:
+    - 6300_0.h5
+  expected_sim_cases: 100
+  expected_real_cases: 81
+  in_steps: 20
+  out_steps: 20
+  train_stride: 20
+  oof_validation_stride: 80
+  spatial_stride: 2
+  num_workers: 0
+
+model:
+  width: 128
+  depth: 10
+  spectral_rank: 32
+  modes_y: 12
+  modes_x: 20
+  expansion: 3
+  dropout: 0.03
+  use_pressure: true
+  use_physics_features: false
+
+loss:
+  data: 1.0
+  tke: 0.25
+  profile: 0.15
+  spectral: 0.08
+  divergence: 0.02
+  interval: 0.03
+
+training:
+  optimizer: AdamW
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  ema_decay: 0.9995
+  mixed_precision: false
+  fixed_endpoint_no_validation_selection: true
+  sim:
+    steps: 2500
+    batch_size: 8
+    learning_rate: 0.0003
+    minimum_learning_rate: 0.000001
+    seed: 20260808
+  oof_point:
+    folds: 5
+    steps: 8000
+    batch_size: 8
+    learning_rate: 0.00008
+    minimum_learning_rate: 0.000001
+    seed_offset: 1000
+  interval_head:
+    steps: 2000
+    batch_size: 2
+    learning_rate: 0.0004
+    minimum_learning_rate: 0.00001
+    seed: 20267808
+    hidden_channels: 96
+    maximum_normalized_shift: 0.5
+    minimum_normalized_radius: 0.0001
+    maximum_normalized_radius: 4.0
+  joint_fullfit:
+    steps: 8000
+    batch_size: 8
+    point_learning_rate: 0.00008
+    point_minimum_learning_rate: 0.000001
+    head_learning_rate: 0.0004
+    head_minimum_learning_rate: 0.00001
+    interval_objective_weight: 0.20
+    seed: 20266808
+
+fixed_decision:
+  center_multiplier: 1.5
+  width_multiplier: 1.0
+  group_width_kind: smooth
+  group_width_multipliers:
+    - [0.75, 1.0]
+    - [0.8250000476837158, 1.0750000476837158]
+    - [0.8500000238418579, 1.100000023841858]
+    - [0.8500000238418579, 1.100000023841858]
+    - [0.8500000238418579, 1.100000023841858]
+    - [0.8500000238418579, 1.100000023841858]
+    - [0.8500000238418579, 1.100000023841858]
+    - [0.8500000238418579, 1.100000023841858]
+    - [0.8500000238418579, 1.100000023841858]
+    - [0.8500000238418579, 1.100000023841858]
+    - [0.8500000238418579, 1.100000023841858]
+    - [0.8500000238418579, 1.100000023841858]
+    - [0.8500000238418579, 1.100000023841858]
+    - [0.8500000238418579, 1.100000023841858]
+    - [0.8500000238418579, 1.100000023841858]
+    - [0.8500000238418579, 1.100000023841858]
+    - [0.8500000238418579, 1.100000023841858]
+    - [0.8500000238418579, 1.100000023841858]
+    - [0.8500000238418579, 1.100000023841858]
+    - [0.8500000238418579, 1.100000023841858]
+
+provenance:
+  scratch_training_data: released_sim100_and_clean81_real_only
+  scratch_initial_weights: random_initialization_only
+  public_used_as_scratch_training_data_or_weights: false
+  historical_development_public_used_to_freeze_interval_constants: true
+  constants_reselected_during_organizer_retraining: false
+  generated_trajectories: false
+  external_pretrained_weights: false
+  prior_submission_or_run_artifacts_as_inputs: false

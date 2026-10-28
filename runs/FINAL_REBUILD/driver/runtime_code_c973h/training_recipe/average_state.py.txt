@@ -1,0 +1,22 @@
+"""Fixed compatible-state interpolation, no data-dependent fitting."""
+import torch
+
+def average_state(states,weights):
+    assert set(states)==set(weights) and abs(sum(weights.values())-1)<1e-12
+    assert all(v>=0 for v in weights.values())
+    first=next(iter(states.values()));out={}
+    for state in states.values():assert set(state)==set(first)
+    for k,base in first.items():
+        vs=[state[k] for state in states.values()]
+        assert all(v.shape==base.shape and v.dtype==base.dtype for v in vs),k
+        if base.is_floating_point() or base.is_complex():
+            dtype=torch.complex128 if base.is_complex() else torch.float64
+            result=torch.zeros_like(base,dtype=dtype)
+            for name,w in weights.items():
+                assert torch.isfinite(states[name][k]).all(),(name,k)
+                result.add_(states[name][k].to(dtype),alpha=w)
+            out[k]=result.to(base.dtype);assert torch.isfinite(out[k]).all(),k
+        else:
+            assert all(torch.equal(v,base) for v in vs),k
+            out[k]=base.clone()
+    return out
