@@ -1,70 +1,77 @@
 # Distilled Neural Operators for Efficient Sim-to-Real Flow Forecasting with Prediction Intervals
 
-This is the solution of team **syouya_tobita** (Syouya Tobita) to Track 1 (Sim2Real) of the [NeurIPS 2026 RealPDE Competition](https://realpdecompetition.github.io/). The task is to forecast 20 future frames of real PIV velocity fields around a NACA4418 airfoil from 20 observed frames, together with prediction intervals.
+This is the solution of team **syouya_tobita** to Track 1 (Sim2Real) of the [NeurIPS 2026 RealPDE Competition](https://realpdecompetition.github.io/).
 
-This repository is the training package that the organizers retrain for the final evaluation, with internal work-log comments and local paths removed; the training code is unchanged. `train()` rebuilds our Codabench submission 948431 from scratch.
+From 20 measured frames of the velocity field around a NACA4418 airfoil (PIV, 32 × 64), the model forecasts the next 20 frames, together with a prediction interval for every value. It is trained on paired CFD simulations and real measurements.
 
-## Results
-Development (public) leaderboard, submission 948431:
-
-| Composite | RelL2 | TKE | MVPE | Time | SPS |
-|---|---|---|---|---|---|
-| **82.033** | 94.66 | 79.77 | 94.12 | 93.43 | 44.32 |
+| Development leaderboard (submission 948431) | Composite | RelL2 | TKE | MVPE | Time | SPS |
+|---|---|---|---|---|---|---|
+| score | **82.033** | 94.66 | 79.77 | 94.12 | 93.43 | 44.32 |
 
 The final ranking is decided on the organizers' private test set.
 
-## Method in brief
-- **Backbone.** A hybrid spectral/convolutional neural operator. Each block combines a low-rank Fourier mix, a depthwise 5×5 convolution and a gated FFN, and a two-scale U-Net context is added. An amplitude/direction factorization of the predicted fluctuations follows.
-- **Score-aware prediction intervals.** Four small heads predict the interval center shift and radius. They are trained with a smooth surrogate of the competition's Safe Prediction Score (SPS) and see only the current window.
-- **Training lineage (15 fixed stages).**
-  - S1–S4: simulation pre-training, real-data fine-tuning and interval-head training.
-  - S6–S8: losses built on a differentiable surrogate of the competition composite score, with decimation-phase, temporal-cadence and reflection augmentation.
-  - S9–S12: self-distillation cycles.
-  - S13–S14: simulation replay with a reflection-averaged teacher.
-  - S15: distillation into a 4-block student.
-- **Turbulence-energy calibration (TKECAL).** At inference, the predicted fluctuations of each window are rescaled toward the turbulent kinetic energy of the observed input frames.
-- **Speed.** The 4-block student runs as a replayed CUDA graph with a fixed batch of 5, with fused NVRTC kernels and pinned asynchronous transfers. It reaches a Time score of 93.4.
+## Method
 
-[METHOD.md](METHOD.md) gives every stage with its losses, optimizer, steps and seeds.
+- **Point forecaster** ([dno/model.py](dno/model.py)): a hybrid neural operator. Each block combines:
+  - a depthwise 5×5 convolution for local structure;
+  - a low-rank Fourier mix for global structure (an FNO layer through a 32-channel bottleneck);
+  - a gated FFN.
 
-## How to run
-**1. Data.** Download the competition training data ([Hugging Face](https://huggingface.co/datasets/AI4Science-WestlakeU/RealPDE-Competition-Data)) into a directory that contains `train_real/` and `train_sim/`. `train_real/7575_0.h5` is excluded by the code, so it may be present or absent.
+  A two-scale U-Net context is added. The decoder predicts the last frame plus a trend plus a learned correction, twice: one prediction gives the *direction* of the fluctuations and the other their *energy*.
+- **Prediction intervals** ([dno/intervals.py](dno/intervals.py)): four small heads that see only the current window. They read parameter-free diagnostics of the window and the forecast, and the forecaster's last hidden field. They were trained with a smooth surrogate of the competition's Safe Prediction Score.
+- **Training** ([docs/pipeline.md](docs/pipeline.md)): 15 fixed stages, with no validation-based selection.
+  - Simulation pre-training, then real-data training of the point model and the intervals.
+  - Composite-score training with exact sub-sampling and reflection augmentation ([dno/losses.py](dno/losses.py), [dno/augment.py](dno/augment.py)).
+  - Self-distillation cycles, then simulation replay with a reflection-averaged teacher.
+  - Finally, distillation into a 4-block student (2.6 M parameters) that runs in about 3.6 ms per window on the evaluation server.
+- **TKECAL** ([dno/tkecal.py](dno/tkecal.py)): at inference, the forecast fluctuations are rescaled per pixel toward the turbulent kinetic energy of the *observed* frames. This partly undoes the damping toward the conditional mean.
 
-**2. Official scoring program.** The training pipeline pins (by sha256) the scoring program of the official Track 1 starting kit, which is not redistributed here. Copy `scoring.py` from the starting kit to `vendor/starting_kit_v9/scoring.py` (see [vendor/starting_kit_v9/README.md](vendor/starting_kit_v9/README.md)).
+[docs/method.md](docs/method.md) gives every stage with its optimizer, schedule, seeds and the changes that mattered.
 
-**3. Build and train** (linux/amd64, one CUDA GPU):
+## Repository
+
+| Path | What it is |
+|---|---|
+| [`dno/`](dno) | Readable reference implementation in plain PyTorch: model, intervals, TKECAL, inference, objectives, augmentation |
+| [`tests/`](tests) | Proof that `dno/` computes exactly what the submission computes |
+| [`docs/`](docs) | Method description and the 15-stage training pipeline |
+| [`package/`](package) | The submitted training package, which reproduces submission 948431 bit for bit (see [package/README.md](package/README.md)) |
+
+`dno/` is the code to read. `package/` is the code that was run: its structure serves exact reproduction of the submission, not readability.
+
+## Usage
+
+**Train** (about 6 hours on one GPU; writes `/path/to/output/runtime`):
 ```bash
-docker build -t realpde-t1 .
+cp /path/to/starting_kit/scoring.py package/vendor/starting_kit_v9/   # official scoring program, not redistributed
+docker build -t dno-package package/
 docker run --rm --network none --gpus '"device=0"' --shm-size 32g \
-  -v /path/to/data:/data:ro -v /path/to/output:/output realpde-t1 \
+  -v /path/to/data:/data:ro -v /path/to/output:/output dno-package \
   python -c "import solution; solution.train('/data', '/output', 'cuda')"
 ```
-Training takes about 6 hours on one RTX A5500. PyTorch allocates at most 3.9 GiB of GPU memory, and the host needs about 12 GB of RAM plus about 25 GB of disk.
 
-**4. Predict:**
+**Predict** with the readable reference:
 ```python
-import solution
-predictor = solution.load_predictor('/path/to/output', 'cuda')
-out = predictor.predict(x)  # x: float32 (N, 20, 32, 64, 3) in physical units
-# out['prediction'], out['lower'], out['upper']: float32 (N, 20, 32, 64, 3)
+import dno
+predictor = dno.Predictor.from_runtime('/path/to/output/runtime', device='cuda')
+out = predictor.predict(x)   # x: float32 (N, 20, 32, 64, 3) in physical units
+out['prediction'], out['lower'], out['upper']
+```
+The competition runtime is also available: `package/solution.py:load_predictor`. It does the same computation, plus CUDA graphs and fused kernels for speed.
+
+**Test** (Python 3.10, torch 2.2.2, pytest; CPU is enough):
+```bash
+python -m pytest tests -q
 ```
 
-## Reproducibility
-- Every stage runs with deterministic algorithms and fixed seeds.
-- On our RTX A5500, `train()` inside the Docker image reproduced the weights, the runtime code and the predictions of submission 948431 bit for bit.
-- On other GPUs the floating-point results differ, so the result is a new sample of the same recipe.
-
-## Repository layout
-| Path | Contents |
-|---|---|
-| `solution.py` | `train(data_dir, output_dir, device)` and `load_predictor(output_dir, device)` |
-| `runs/FINAL_REBUILD/driver/` | stage drivers (S1–S7, S8–S12, S13–S15 and packaging) |
-| `runs/*/`, `scripts/`, `src/realpde/`, `configs/` | the stage trainers and the library they use |
-| `tkecal_patch.py` | the TKECAL inference transform |
-| `code_948431.json` | sha256 of the runtime code of submission 948431, checked by `train()` |
-| `submission/c628_runtime/` | runtime code of the first stages |
+## Verification
+- **Reference vs submitted code.** `dno/` was run against the runtime code of submission 948431, which ships in `package/` and is byte-checked by the tests. With random weights, the forecast, the hidden field and the intervals are bitwise equal on CPU.
+- **Training objectives.** The metrics, the SPS surrogate, the composite loss, the reflection augmentation, the window sampling and the complete stage-15 objective were checked against the trainers' own code; all are bitwise equal.
+- **Trained weights on 12 real windows (GPU).** The reference and the competition runtime differ by at most 7e-5, and the relative L2 between their forecasts is 1.9e-5. The competition runtime runs part of its FFN in half precision.
+- **Retraining.** `package/` retrained from scratch inside its Docker image reproduced the weights and predictions of submission 948431 bit for bit on an RTX A5500.
 
 ## Citation
+
 If you use this code, please cite the competition and the benchmark:
 ```bibtex
 @inproceedings{wu2026neurips,

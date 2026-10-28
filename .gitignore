@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
-/data/
+.pytest_cache/
+/package/data/
+/package/runs/FINAL_REBUILD/R1_*/
+/package/vendor/starting_kit_v9/scoring.py
 /output/
-/runs/FINAL_REBUILD/R1_*/
-/vendor/starting_kit_v9/scoring.py

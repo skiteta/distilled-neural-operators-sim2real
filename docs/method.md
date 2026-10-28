@@ -1,4 +1,6 @@
-# syouya_tobita: Track 1 method
+# Method
+
+This is the method description submitted with the training package (template of the competition organizers). The readable implementation is in [../dno/](../dno), and [pipeline.md](pipeline.md) maps every training stage to code.
 
 ## 1. Summary
 A 4-block factorized neural operator with four interval heads (2.73 M parameters in total) is produced by a fixed 15-stage lineage:
